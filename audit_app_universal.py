@@ -458,12 +458,22 @@ def generate_part1(df_led, year):
     n_risk = len(rm[rm['risk_score'] > 0])
     return buf, monthly, acct, rm, n_risk
 
-def read_ledger(f):
+
+def read_ledger(f, usecols=None):
     raw = f.read()
     f.seek(0)
     if raw[:2] == b'\x1f\x8b':
-        return pd.read_csv(io.StringIO(gzip.decompress(raw).decode('utf-8')), dtype={'account_code': str})
-    return pd.read_csv(io.BytesIO(raw), dtype={'account_code': str})
+        return pd.read_csv(io.StringIO(gzip.decompress(raw).decode('utf-8')), dtype={'account_code': str}, usecols=usecols)
+    return pd.read_csv(io.BytesIO(raw), dtype={'account_code': str}, usecols=usecols)
+
+def read_ledger_in_chunks(f, chunksize=100000, usecols=None):
+    f.seek(0)
+    raw = f.read()
+    f.seek(0)
+    if raw[:2] == b'\x1f\x8b':
+        bio = io.BytesIO(gzip.decompress(raw))
+        return pd.read_csv(bio, dtype={'account_code': str}, chunksize=chunksize, usecols=usecols)
+    return pd.read_csv(io.BytesIO(raw), dtype={'account_code': str}, chunksize=chunksize, usecols=usecols)
 
 def get_year(name):
     for y in range(2020, 2030):
@@ -487,21 +497,88 @@ def load_tb(files):
         frames.append(df)
     return pd.concat(frames, ignore_index=True), stats
 
-def load_ledger_stats(files):
-    """Ledger файлуудыг уншиж stats + бүрэн DataFrame буцаана."""
+def load_ledger_stats(files, sample_per_year=15000, chunksize=100000):
+    """Ledger файлуудыг chunk-ээр уншиж stats + txn sample буцаана.
+    Streamlit Cloud дээр OOM болохоос сэргийлнэ.
+    """
     stats = {}
-    all_frames = []
+    sampled_frames = []
+
+    needed_cols = [
+        'report_year','account_code','account_name','transaction_no','transaction_date',
+        'journal_no','document_no','counterparty_name','counterparty_id',
+        'transaction_description','debit_mnt','credit_mnt','balance_mnt','month'
+    ]
+
     for f in files:
         year = get_year(f.name)
-        f.seek(0)
-        df = read_ledger(f)
-        for c in ['debit_mnt', 'credit_mnt']:
-            df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
-        df['report_year'] = str(year)
-        mo = df.groupby('month').agg(rows=('debit_mnt', 'count'), debit=('debit_mnt', 'sum'), credit=('credit_mnt', 'sum'))
-        stats[year] = {'rows': len(df), 'accounts': df['account_code'].nunique(), 'months': df['month'].nunique(), 'monthly': mo}
-        all_frames.append(df)
-    full_df = pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame()
+        total_rows = 0
+        acct_set = set()
+        month_set = set()
+        monthly_rows = []
+        sampled_year = []
+
+        try:
+            chunks = read_ledger_in_chunks(f, chunksize=chunksize)
+            for chunk in chunks:
+                total_rows += len(chunk)
+
+                # missing cols fill
+                for c in needed_cols:
+                    if c not in chunk.columns:
+                        chunk[c] = '' if c in ('report_year','account_code','account_name','transaction_no','transaction_date','journal_no','document_no','counterparty_name','counterparty_id','transaction_description','month') else 0
+
+                chunk['account_code'] = chunk['account_code'].astype(str)
+                chunk['debit_mnt'] = pd.to_numeric(chunk['debit_mnt'], errors='coerce').fillna(0)
+                chunk['credit_mnt'] = pd.to_numeric(chunk['credit_mnt'], errors='coerce').fillna(0)
+                chunk['report_year'] = str(year)
+
+                acct_set.update(chunk['account_code'].dropna().astype(str).unique().tolist())
+                month_set.update(chunk['month'].dropna().astype(str).unique().tolist())
+
+                mo = chunk.groupby('month').agg(
+                    rows=('debit_mnt', 'count'),
+                    debit=('debit_mnt', 'sum'),
+                    credit=('credit_mnt', 'sum')
+                ).reset_index()
+                monthly_rows.append(mo)
+
+                # reservoir-like capped sampling per year
+                remaining = max(sample_per_year - sum(len(x) for x in sampled_year), 0)
+                if remaining > 0:
+                    take_n = min(len(chunk), max(1000, remaining))
+                    sample_chunk = chunk.sample(n=min(take_n, len(chunk)), random_state=42)[needed_cols].copy()
+                    sampled_year.append(sample_chunk)
+        except Exception:
+            # fallback: small/full read if chunking failed
+            f.seek(0)
+            chunk = read_ledger(f)
+            total_rows = len(chunk)
+            for c in needed_cols:
+                if c not in chunk.columns:
+                    chunk[c] = '' if c in ('report_year','account_code','account_name','transaction_no','transaction_date','journal_no','document_no','counterparty_name','counterparty_id','transaction_description','month') else 0
+            chunk['account_code'] = chunk['account_code'].astype(str)
+            chunk['debit_mnt'] = pd.to_numeric(chunk['debit_mnt'], errors='coerce').fillna(0)
+            chunk['credit_mnt'] = pd.to_numeric(chunk['credit_mnt'], errors='coerce').fillna(0)
+            chunk['report_year'] = str(year)
+            acct_set.update(chunk['account_code'].dropna().astype(str).unique().tolist())
+            month_set.update(chunk['month'].dropna().astype(str).unique().tolist())
+            monthly_rows.append(chunk.groupby('month').agg(rows=('debit_mnt','count'), debit=('debit_mnt','sum'), credit=('credit_mnt','sum')).reset_index())
+            sampled_year.append(chunk.sample(n=min(sample_per_year, len(chunk)), random_state=42)[needed_cols].copy())
+
+        mo = pd.concat(monthly_rows, ignore_index=True).groupby('month').agg(
+            rows=('rows','sum'),
+            debit=('debit','sum'),
+            credit=('credit','sum')
+        ).sort_index()
+        stats[year] = {'rows': int(total_rows), 'accounts': int(len(acct_set)), 'months': int(len(month_set)), 'monthly': mo}
+
+        if sampled_year:
+            year_sample = pd.concat(sampled_year, ignore_index=True).head(sample_per_year)
+            year_sample['report_year'] = str(year)
+            sampled_frames.append(year_sample)
+
+    full_df = pd.concat(sampled_frames, ignore_index=True) if sampled_frames else pd.DataFrame(columns=needed_cols)
     return stats, full_df
 
 def load_part1(files):
@@ -1061,6 +1138,8 @@ elif page.startswith("2"):
                  "200 = тэнцвэртэй (анхдагч). "
                  "500 = удаан, өндөр нарийвчлал.")
 
+    if led_files:
+        st.caption("Том ledger файлууд дээр memory хэтрэхээс сэргийлж гүйлгээний түвшний шинжилгээнд sample ашиглаж байна.")
     has_any = tb_files or led_files
     if st.button("🚀 Шинжилгээ", type="primary", use_container_width=True) and has_any:
         # Дансны түвшний шинжилгээ (TB + Ledger хоёулаа байвал)
@@ -1072,7 +1151,7 @@ elif page.startswith("2"):
         if tb_files and led_files:
             with st.spinner("TB уншиж байна..."):
                 tb_all, tb_st = load_tb(tb_files)
-            with st.spinner("Ledger уншиж байна..."):
+            with st.spinner("Ledger уншиж байна... (санамсаргүй sample ашиглаж байна)"):
                 led_st, ledger_full = load_ledger_stats(led_files)
             if p1_files:
                 with st.spinner("Part1 уншиж байна..."):
@@ -1081,7 +1160,7 @@ elif page.startswith("2"):
                 df, X, y, feats, res, best, fi, ym = run_ml(tb_all, cont, nest)
         elif led_files:
             # Зөвхөн Ledger байвал — stats + full уншна
-            with st.spinner("Ledger уншиж байна..."):
+            with st.spinner("Ledger уншиж байна... (санамсаргүй sample ашиглаж байна)"):
                 led_st, ledger_full = load_ledger_stats(led_files)
             if p1_files:
                 with st.spinner("Part1 уншиж байна..."):
