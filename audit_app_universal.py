@@ -52,7 +52,7 @@ def safe_float(v):
     if v is None or v == '':
         return 0.0
     try:
-        return float(v)
+        return float(str(v).replace(',', '').strip())
     except Exception:
         return 0.0
 
@@ -116,7 +116,7 @@ def _match_col(h, field):
     return any(p in h2 for p in COL_PATTERNS.get(field, []))
 def _auto_map(headers):
     m, used = {}, set()
-    for f in ['account_code','debit_mnt','credit_mnt','transaction_date','account_name','counterparty_name','transaction_description','balance_mnt','journal_no','document_no']:
+    for f in ['account_code','debit_mnt','credit_mnt','amount_mnt','transaction_date','account_name','counterparty_name','transaction_description','balance_mnt','journal_no','document_no','asset_expense']:
         for i, h in enumerate(headers):
             if i in used: continue
             if _match_col(h, f): m[f]=i; used.add(i); break
