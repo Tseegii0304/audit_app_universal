@@ -101,7 +101,7 @@ COL_PATTERNS = {
     'account_code': ['дансны код','данс код','account code','account no','account number','acc code','код','дебет данс','кредит данс'],
     'account_name': ['дансны нэр','данс нэр','account name','acc name','нэр'],
     'transaction_date': ['огноо','date','transaction date','txn date'],
-    'debit_mnt': ['дебит','debit','dt','дт','debit amount'],
+    'debit_mnt': ['дебит','дебет','debit','dt','дт','debit amount'],
     'credit_mnt': ['кредит','credit','ct','кт','credit amount'],
     'amount_mnt': ['мөнгөн дүн','дүн','amount','amt','transaction amount'],
     'balance_mnt': ['үлдэгдэл','balance','bal','ending balance'],
@@ -138,11 +138,20 @@ def _find_header_row(all_rows, max_scan=30):
             best_s, best_i = score, i
     return best_i, best_s
 
+
 def _build_dual_entry_from_table(file_obj, report_year):
     import openpyxl
     EDT_COLUMNS = ['report_year','account_code','account_name','transaction_no','transaction_date',
                    'journal_no','document_no','counterparty_name','counterparty_id',
                    'transaction_description','debit_mnt','credit_mnt','balance_mnt','month']
+
+    def _pick_idx(headers, *needles):
+        for i, h in enumerate(headers):
+            hs = str(h).strip().lower()
+            if any(n in hs for n in needles):
+                return i
+        return None
+
     file_obj.seek(0)
     wb = openpyxl.load_workbook(file_obj, read_only=True, data_only=True)
     ws = wb[wb.sheetnames[0]]
@@ -154,21 +163,39 @@ def _build_dual_entry_from_table(file_obj, report_year):
     wb.close()
     if not all_rows:
         return pd.DataFrame(columns=EDT_COLUMNS), 0
+
     hdr_i, hdr_score = _find_header_row(all_rows)
     if hdr_score < 3:
         return pd.DataFrame(columns=EDT_COLUMNS), 0
+
     headers = [str(c).strip() if c is not None else f'col_{j}' for j, c in enumerate(all_rows[hdr_i])]
     cm = _auto_map(headers)
 
-    # This specific format has Debit account, Credit account and one Amount column.
-    debit_idx = cm.get('debit_mnt')
-    credit_idx = cm.get('credit_mnt')
-    amount_idx = cm.get('amount_mnt')
-    date_idx = cm.get('transaction_date')
-    doc_idx = cm.get('document_no')
-    cp_idx = cm.get('counterparty_name')
-    desc_idx = cm.get('transaction_description')
-    j_idx = cm.get('journal_no')
+    debit_idx = _pick_idx(headers, 'дебет', 'debit')
+    credit_idx = _pick_idx(headers, 'кредит', 'credit')
+    amount_idx = _pick_idx(headers, 'мөнгөн дүн', 'amount', 'дүн')
+    date_idx = _pick_idx(headers, 'огноо', 'date')
+    doc_idx = _pick_idx(headers, 'баримт', 'document', 'doc no')
+    cp_idx = _pick_idx(headers, 'байгууллагын нэр', 'харилцагч', 'counterparty', 'partner', 'vendor', 'customer')
+    desc_idx = _pick_idx(headers, 'гүйлгээний утга', 'тайлбар', 'description', 'memo', 'narration')
+    j_idx = _pick_idx(headers, 'журналын төрөл', 'журнал', 'journal')
+
+    if debit_idx is None:
+        debit_idx = cm.get('debit_mnt')
+    if credit_idx is None:
+        credit_idx = cm.get('credit_mnt')
+    if amount_idx is None:
+        amount_idx = cm.get('amount_mnt')
+    if date_idx is None:
+        date_idx = cm.get('transaction_date')
+    if doc_idx is None:
+        doc_idx = cm.get('document_no')
+    if cp_idx is None:
+        cp_idx = cm.get('counterparty_name') if 'counterparty_name' in cm else cm.get('account_name')
+    if desc_idx is None:
+        desc_idx = cm.get('transaction_description')
+    if j_idx is None:
+        j_idx = cm.get('journal_no')
 
     if debit_idx is None or credit_idx is None or amount_idx is None:
         return pd.DataFrame(columns=EDT_COLUMNS), 0
@@ -178,10 +205,16 @@ def _build_dual_entry_from_table(file_obj, report_year):
     for row in all_rows[hdr_i+1:]:
         if not row or all(c is None or str(c).strip()=='' for c in row):
             continue
+
         debit_acct = str(row[debit_idx]).strip() if debit_idx < len(row) and row[debit_idx] is not None else ''
         credit_acct = str(row[credit_idx]).strip() if credit_idx < len(row) and row[credit_idx] is not None else ''
         amount = safe_float(row[amount_idx]) if amount_idx < len(row) else 0.0
-        if not debit_acct or not credit_acct or amount == 0:
+
+        if debit_acct.lower() in ('дебет', 'debit') or credit_acct.lower() in ('кредит', 'credit'):
+            continue
+        if not re.fullmatch(r'\d{3,}', debit_acct) or not re.fullmatch(r'\d{3,}', credit_acct):
+            continue
+        if amount == 0:
             continue
 
         raw_date = row[date_idx] if date_idx is not None and date_idx < len(row) else ''
@@ -190,11 +223,15 @@ def _build_dual_entry_from_table(file_obj, report_year):
         else:
             s = str(raw_date).strip() if raw_date is not None else ''
             tx_date = s
-            # convert 25.01.02 -> 2025-01-02
             m = re.match(r'^(\d{2})[./-](\d{2})[./-](\d{2})$', s)
             if m:
                 yy, mm, dd = m.groups()
                 tx_date = f'20{yy}-{mm}-{dd}'
+            else:
+                m2 = re.match(r'^(\d{4})[./-](\d{2})[./-](\d{2})$', s)
+                if m2:
+                    yyyy, mm, dd = m2.groups()
+                    tx_date = f'{yyyy}-{mm}-{dd}'
 
         doc_no = str(row[doc_idx]).strip() if doc_idx is not None and doc_idx < len(row) and row[doc_idx] is not None else ''
         cp_name = str(row[cp_idx]).strip() if cp_idx is not None and cp_idx < len(row) and row[cp_idx] is not None else ''
