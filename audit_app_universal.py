@@ -52,7 +52,7 @@ def safe_float(v):
     if v is None or v == '':
         return 0.0
     try:
-        return float(v)
+        return float(str(v).replace(',', '').strip())
     except Exception:
         return 0.0
 
@@ -101,7 +101,7 @@ COL_PATTERNS = {
     'account_code': ['дансны код','данс код','account code','account no','account number','acc code','код','дебет данс','кредит данс'],
     'account_name': ['дансны нэр','данс нэр','account name','acc name','нэр'],
     'transaction_date': ['огноо','date','transaction date','txn date'],
-    'debit_mnt': ['дебит','debit','dt','дт','debit amount'],
+    'debit_mnt': ['дебит','дебет','debit','dt','дт','debit amount'],
     'credit_mnt': ['кредит','credit','ct','кт','credit amount'],
     'amount_mnt': ['мөнгөн дүн','дүн','amount','amt','transaction amount'],
     'balance_mnt': ['үлдэгдэл','balance','bal','ending balance'],
@@ -116,9 +116,7 @@ def _match_col(h, field):
     return any(p in h2 for p in COL_PATTERNS.get(field, []))
 def _auto_map(headers):
     m, used = {}, set()
-    # Эхлээд тодорхой багануудыг олох (дараалал чухал - тодорхой нэрийг эхэлж тааруулна)
-    for f in ['transaction_date','amount_mnt','debit_mnt','credit_mnt','account_code','account_name',
-              'counterparty_name','transaction_description','balance_mnt','journal_no','document_no']:
+    for f in ['account_code','debit_mnt','credit_mnt','amount_mnt','transaction_date','account_name','counterparty_name','transaction_description','balance_mnt','journal_no','document_no','asset_expense']:
         for i, h in enumerate(headers):
             if i in used: continue
             if _match_col(h, f): m[f]=i; used.add(i); break
@@ -140,11 +138,20 @@ def _find_header_row(all_rows, max_scan=30):
             best_s, best_i = score, i
     return best_i, best_s
 
+
 def _build_dual_entry_from_table(file_obj, report_year):
     import openpyxl
     EDT_COLUMNS = ['report_year','account_code','account_name','transaction_no','transaction_date',
                    'journal_no','document_no','counterparty_name','counterparty_id',
                    'transaction_description','debit_mnt','credit_mnt','balance_mnt','month']
+
+    def _pick_idx(headers, *needles):
+        for i, h in enumerate(headers):
+            hs = str(h).strip().lower()
+            if any(n in hs for n in needles):
+                return i
+        return None
+
     file_obj.seek(0)
     wb = openpyxl.load_workbook(file_obj, read_only=True, data_only=True)
     ws = wb[wb.sheetnames[0]]
@@ -156,21 +163,39 @@ def _build_dual_entry_from_table(file_obj, report_year):
     wb.close()
     if not all_rows:
         return pd.DataFrame(columns=EDT_COLUMNS), 0
+
     hdr_i, hdr_score = _find_header_row(all_rows)
     if hdr_score < 3:
         return pd.DataFrame(columns=EDT_COLUMNS), 0
+
     headers = [str(c).strip() if c is not None else f'col_{j}' for j, c in enumerate(all_rows[hdr_i])]
     cm = _auto_map(headers)
 
-    # This specific format has Debit account, Credit account and one Amount column.
-    debit_idx = cm.get('debit_mnt')
-    credit_idx = cm.get('credit_mnt')
-    amount_idx = cm.get('amount_mnt')
-    date_idx = cm.get('transaction_date')
-    doc_idx = cm.get('document_no')
-    cp_idx = cm.get('counterparty_name')
-    desc_idx = cm.get('transaction_description')
-    j_idx = cm.get('journal_no')
+    debit_idx = _pick_idx(headers, 'дебет', 'debit')
+    credit_idx = _pick_idx(headers, 'кредит', 'credit')
+    amount_idx = _pick_idx(headers, 'мөнгөн дүн', 'amount', 'дүн')
+    date_idx = _pick_idx(headers, 'огноо', 'date')
+    doc_idx = _pick_idx(headers, 'баримт', 'document', 'doc no')
+    cp_idx = _pick_idx(headers, 'байгууллагын нэр', 'харилцагч', 'counterparty', 'partner', 'vendor', 'customer')
+    desc_idx = _pick_idx(headers, 'гүйлгээний утга', 'тайлбар', 'description', 'memo', 'narration')
+    j_idx = _pick_idx(headers, 'журналын төрөл', 'журнал', 'journal')
+
+    if debit_idx is None:
+        debit_idx = cm.get('debit_mnt')
+    if credit_idx is None:
+        credit_idx = cm.get('credit_mnt')
+    if amount_idx is None:
+        amount_idx = cm.get('amount_mnt')
+    if date_idx is None:
+        date_idx = cm.get('transaction_date')
+    if doc_idx is None:
+        doc_idx = cm.get('document_no')
+    if cp_idx is None:
+        cp_idx = cm.get('counterparty_name') if 'counterparty_name' in cm else cm.get('account_name')
+    if desc_idx is None:
+        desc_idx = cm.get('transaction_description')
+    if j_idx is None:
+        j_idx = cm.get('journal_no')
 
     if debit_idx is None or credit_idx is None or amount_idx is None:
         return pd.DataFrame(columns=EDT_COLUMNS), 0
@@ -180,10 +205,16 @@ def _build_dual_entry_from_table(file_obj, report_year):
     for row in all_rows[hdr_i+1:]:
         if not row or all(c is None or str(c).strip()=='' for c in row):
             continue
+
         debit_acct = str(row[debit_idx]).strip() if debit_idx < len(row) and row[debit_idx] is not None else ''
         credit_acct = str(row[credit_idx]).strip() if credit_idx < len(row) and row[credit_idx] is not None else ''
         amount = safe_float(row[amount_idx]) if amount_idx < len(row) else 0.0
-        if not debit_acct or not credit_acct or amount == 0:
+
+        if debit_acct.lower() in ('дебет', 'debit') or credit_acct.lower() in ('кредит', 'credit'):
+            continue
+        if not re.fullmatch(r'\d{3,}', debit_acct) or not re.fullmatch(r'\d{3,}', credit_acct):
+            continue
+        if amount == 0:
             continue
 
         raw_date = row[date_idx] if date_idx is not None and date_idx < len(row) else ''
@@ -192,11 +223,15 @@ def _build_dual_entry_from_table(file_obj, report_year):
         else:
             s = str(raw_date).strip() if raw_date is not None else ''
             tx_date = s
-            # convert 25.01.02 -> 2025-01-02
             m = re.match(r'^(\d{2})[./-](\d{2})[./-](\d{2})$', s)
             if m:
                 yy, mm, dd = m.groups()
                 tx_date = f'20{yy}-{mm}-{dd}'
+            else:
+                m2 = re.match(r'^(\d{4})[./-](\d{2})[./-](\d{2})$', s)
+                if m2:
+                    yyyy, mm, dd = m2.groups()
+                    tx_date = f'{yyyy}-{mm}-{dd}'
 
         doc_no = str(row[doc_idx]).strip() if doc_idx is not None and doc_idx < len(row) and row[doc_idx] is not None else ''
         cp_name = str(row[cp_idx]).strip() if cp_idx is not None and cp_idx < len(row) and row[cp_idx] is not None else ''
@@ -1232,24 +1267,23 @@ elif page.startswith("2"):
 **IF-д орно** = Isolation Forest алгоритмд шууд шинж чанар болж ордог (тоон оноогүй ч нөлөөлнө)
                     """)
 
-                n_txn_anom = txn_result['txn_anomaly'].sum() if 'txn_anomaly' in txn_result.columns else 0
+                n_txn_anom = txn_result['txn_anomaly'].sum()
                 c1,c2,c3,c4 = st.columns(4)
                 c1.metric("Шинжилсэн гүйлгээ", f"{len(txn_result):,}")
-                c2.metric("Хэвийн бус", f"{n_txn_anom:,}", delta=f"{n_txn_anom/max(len(txn_result),1)*100:.1f}%", delta_color="inverse")
-                c3.metric("Тайлбар зөрчилтэй", f"{txn_result['desc_mismatch'].sum():,}" if 'desc_mismatch' in txn_result.columns else "0")
-                c4.metric("Чиглэл зөрсөн", f"{txn_result['dir_mismatch'].sum():,}" if 'dir_mismatch' in txn_result.columns else "0")
+                c2.metric("Хэвийн бус", f"{n_txn_anom:,}", delta=f"{n_txn_anom/len(txn_result)*100:.1f}%", delta_color="inverse")
+                c3.metric("Тайлбар зөрчилтэй", f"{txn_result['desc_mismatch'].sum():,}")
+                c4.metric("Чиглэл зөрсөн", f"{txn_result['dir_mismatch'].sum():,}")
 
                 # Нэмэлт metric row
                 c5,c6,c7,c8 = st.columns(4)
-                c5.metric("Давхардсан", f"{txn_result['is_dup'].sum():,}" if 'is_dup' in txn_result.columns else "0")
-                c6.metric("Ховор харилцагч", f"{txn_result['cp_rare'].sum():,}" if 'cp_rare' in txn_result.columns else "0")
-                c7.metric("Тайлбаргүй", f"{txn_result['desc_empty'].sum():,}" if 'desc_empty' in txn_result.columns else "0")
-                c8.metric("Дүн хэт зөрсөн (>3σ)", f"{(txn_result['amt_zscore'].abs()>3).sum():,}" if 'amt_zscore' in txn_result.columns else "0")
+                c5.metric("Давхардсан", f"{txn_result['is_dup'].sum():,}")
+                c6.metric("Ховор харилцагч", f"{txn_result['cp_rare'].sum():,}")
+                c7.metric("Тайлбаргүй", f"{txn_result['desc_empty'].sum():,}")
+                c8.metric("Дүн хэт зөрсөн (>3σ)", f"{(txn_result['amt_zscore'].abs()>3).sum():,}")
 
                 # Эрсдэлийн түвшний тархалт
-                if 'txn_risk_level' in txn_result.columns:
-                    rl = txn_result['txn_risk_level'].value_counts().reindex(['🟢 Бага','🟡 Дунд','🟠 Өндөр','🔴 Маш өндөр']).fillna(0)
-                    st.plotly_chart(px.bar(x=rl.index, y=rl.values, color=rl.index, color_discrete_map={'🟢 Бага':'#4CAF50','🟡 Дунд':'#FFC107','🟠 Өндөр':'#FF9800','🔴 Маш өндөр':'#F44336'}, labels={'x':'Эрсдэлийн түвшин','y':'Тоо'}, title="Гүйлгээний эрсдэлийн тархалт").update_layout(height=300, showlegend=False), use_container_width=True)
+                rl = txn_result['txn_risk_level'].value_counts().reindex(['🟢 Бага','🟡 Дунд','🟠 Өндөр','🔴 Маш өндөр']).fillna(0)
+                st.plotly_chart(px.bar(x=rl.index, y=rl.values, color=rl.index, color_discrete_map={'🟢 Бага':'#4CAF50','🟡 Дунд':'#FFC107','🟠 Өндөр':'#FF9800','🔴 Маш өндөр':'#F44336'}, labels={'x':'Эрсдэлийн түвшин','y':'Тоо'}, title="Гүйлгээний эрсдэлийн тархалт").update_layout(height=300, showlegend=False), use_container_width=True)
 
                 # Шинж чанар бүрийн илрүүлэлтийн тойм
                 with st.expander("📊 Шинж чанар бүрийн илрүүлэлтийн тойм", expanded=False):
@@ -1283,18 +1317,11 @@ elif page.startswith("2"):
                     risk_f = st.selectbox("Эрсдэлийн түвшин:", ['Бүгд','🔴 Маш өндөр','🟠 Өндөр','🟡 Дунд'], key='txn_risk_f')
                 with fc2:
                     year_f = st.selectbox("Он:", ['Бүгд'] + [str(y) for y in txn_years], key='txn_year_f')
-                if risk_f == 'Бүгд':
-                    t_show = txn_result[txn_result['txn_anomaly']==1].copy() if 'txn_anomaly' in txn_result.columns else txn_result.copy()
-                elif 'txn_risk_level' in txn_result.columns:
-                    t_show = txn_result[txn_result['txn_risk_level']==risk_f].copy()
-                else:
-                    t_show = txn_result.copy()
+                t_show = txn_result[txn_result['txn_anomaly']==1].copy() if risk_f=='Бүгд' else txn_result[txn_result['txn_risk_level']==risk_f].copy()
                 if year_f != 'Бүгд' and 'report_year' in t_show.columns:
                     t_show = t_show[t_show['report_year'].astype(str)==year_f]
                 cols_show = ['txn_risk_level','txn_risk','report_year','account_code','account_name','counterparty_name','transaction_date','debit_mnt','credit_mnt','transaction_description','desc_mismatch','name_no_overlap','dir_mismatch','amt_zscore','is_dup','cp_rare']
-                t_disp = t_show[[c for c in cols_show if c in t_show.columns]]
-                if 'txn_risk' in t_disp.columns:
-                    t_disp = t_disp.sort_values('txn_risk', ascending=False)
+                t_disp = t_show[[c for c in cols_show if c in t_show.columns]].sort_values('txn_risk', ascending=False)
                 st.write(f"Нийт: **{len(t_disp):,}** гүйлгээ")
                 st.dataframe(t_disp, use_container_width=True, hide_index=True, height=500)
                 st.download_button("📥 Хэвийн бус гүйлгээ CSV", t_disp.to_csv(index=False).encode('utf-8-sig'), "anomaly_txn.csv")
@@ -1307,10 +1334,6 @@ elif page.startswith("2"):
                 txn_filtered = txn_result.copy()
                 if year_f2 != 'Бүгд' and 'report_year' in txn_filtered.columns:
                     txn_filtered = txn_filtered[txn_filtered['report_year'].astype(str)==year_f2]
-                # Дутуу баганууд нэмэх
-                for _c in ['amount','txn_anomaly','desc_mismatch','dir_mismatch','counterparty_name','account_code','account_name']:
-                    if _c not in txn_filtered.columns:
-                        txn_filtered[_c] = 0 if _c in ('amount','txn_anomaly','desc_mismatch','dir_mismatch') else ''
                 cp_r = txn_filtered[txn_filtered['counterparty_name'].fillna('')!=''].groupby('counterparty_name').agg(
                     total=('amount','count'), anomaly=('txn_anomaly','sum'), amount=('amount','sum'),
                     accounts=('account_code','nunique'), desc_mis=('desc_mismatch','sum'), dir_mis=('dir_mismatch','sum')
