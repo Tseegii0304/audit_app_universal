@@ -58,41 +58,82 @@ def safe_float(v):
 
 def process_raw_tb(file_obj):
     import openpyxl
-    wb = openpyxl.load_workbook(file_obj, read_only=True)
+
+    base_cols = [
+        'account_code', 'account_name',
+        'opening_debit', 'opening_credit',
+        'turnover_debit', 'turnover_credit',
+        'closing_debit', 'closing_credit'
+    ]
+
+    file_obj.seek(0)
+    wb = openpyxl.load_workbook(file_obj, read_only=True, data_only=True)
     ws = wb[wb.sheetnames[0]]
     rows = []
+
     for row in ws.iter_rows(values_only=True):
-        if row[0] is None:
+        if not row or len(row) < 2 or row[0] is None:
             continue
         try:
             int(float(row[0]))
         except Exception:
             continue
-        code = str(row[1]).strip() if row[1] else ''
+
+        code = str(row[1]).strip() if len(row) > 1 and row[1] else ''
         if not code or not re.match(r'\d{3}-', code):
             continue
+
         rows.append({
             'account_code': code,
-            'account_name': str(row[2]).strip() if row[2] else '',
-            'opening_debit': safe_float(row[3]),
-            'opening_credit': safe_float(row[4]),
-            'turnover_debit': safe_float(row[5]),
-            'turnover_credit': safe_float(row[6]),
-            'closing_debit': safe_float(row[7]),
-            'closing_credit': safe_float(row[8]),
+            'account_name': str(row[2]).strip() if len(row) > 2 and row[2] else '',
+            'opening_debit': safe_float(row[3]) if len(row) > 3 else 0.0,
+            'opening_credit': safe_float(row[4]) if len(row) > 4 else 0.0,
+            'turnover_debit': safe_float(row[5]) if len(row) > 5 else 0.0,
+            'turnover_credit': safe_float(row[6]) if len(row) > 6 else 0.0,
+            'closing_debit': safe_float(row[7]) if len(row) > 7 else 0.0,
+            'closing_credit': safe_float(row[8]) if len(row) > 8 else 0.0,
         })
+
     wb.close()
-    df = pd.DataFrame(rows)
+
+    if not rows:
+        empty_clean = pd.DataFrame(columns=base_cols)
+        empty_sum = pd.DataFrame(columns=[
+            'account_code','account_name',
+            'opening_debit','opening_credit','opening_balance_signed',
+            'turnover_debit','turnover_credit','turnover_net_signed',
+            'closing_debit','closing_credit','closing_balance_signed',
+            'net_change_signed'
+        ])
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine='openpyxl') as w:
+            empty_clean.to_excel(w, sheet_name='01_TB_CLEAN', index=False)
+            empty_sum.to_excel(w, sheet_name='02_ACCOUNT_SUMMARY', index=False)
+        buf.seek(0)
+        return buf, empty_sum
+
+    df = pd.DataFrame(rows, columns=base_cols)
+
+    for c in base_cols[2:]:
+        if c not in df.columns:
+            df[c] = 0.0
+
     df['opening_balance_signed'] = df['opening_debit'] - df['opening_credit']
     df['turnover_net_signed'] = df['turnover_debit'] - df['turnover_credit']
     df['closing_balance_signed'] = df['closing_debit'] - df['closing_credit']
     df['net_change_signed'] = df['closing_balance_signed'] - df['opening_balance_signed']
-    tb_sum = df[['account_code','account_name','opening_debit','opening_credit','opening_balance_signed',
-                  'turnover_debit','turnover_credit','turnover_net_signed',
-                  'closing_debit','closing_credit','closing_balance_signed','net_change_signed']].copy()
+
+    tb_sum = df[[
+        'account_code','account_name',
+        'opening_debit','opening_credit','opening_balance_signed',
+        'turnover_debit','turnover_credit','turnover_net_signed',
+        'closing_debit','closing_credit','closing_balance_signed',
+        'net_change_signed'
+    ]].copy()
+
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='openpyxl') as w:
-        df[['account_code','account_name','opening_debit','opening_credit','turnover_debit','turnover_credit','closing_debit','closing_credit']].to_excel(w, sheet_name='01_TB_CLEAN', index=False)
+        df[base_cols].to_excel(w, sheet_name='01_TB_CLEAN', index=False)
         tb_sum.to_excel(w, sheet_name='02_ACCOUNT_SUMMARY', index=False)
     buf.seek(0)
     return buf, tb_sum
@@ -458,22 +499,12 @@ def generate_part1(df_led, year):
     n_risk = len(rm[rm['risk_score'] > 0])
     return buf, monthly, acct, rm, n_risk
 
-
-def read_ledger(f, usecols=None):
+def read_ledger(f):
     raw = f.read()
     f.seek(0)
     if raw[:2] == b'\x1f\x8b':
-        return pd.read_csv(io.StringIO(gzip.decompress(raw).decode('utf-8')), dtype={'account_code': str}, usecols=usecols)
-    return pd.read_csv(io.BytesIO(raw), dtype={'account_code': str}, usecols=usecols)
-
-def read_ledger_in_chunks(f, chunksize=100000, usecols=None):
-    f.seek(0)
-    raw = f.read()
-    f.seek(0)
-    if raw[:2] == b'\x1f\x8b':
-        bio = io.BytesIO(gzip.decompress(raw))
-        return pd.read_csv(bio, dtype={'account_code': str}, chunksize=chunksize, usecols=usecols)
-    return pd.read_csv(io.BytesIO(raw), dtype={'account_code': str}, chunksize=chunksize, usecols=usecols)
+        return pd.read_csv(io.StringIO(gzip.decompress(raw).decode('utf-8')), dtype={'account_code': str})
+    return pd.read_csv(io.BytesIO(raw), dtype={'account_code': str})
 
 def get_year(name):
     for y in range(2020, 2030):
@@ -497,88 +528,21 @@ def load_tb(files):
         frames.append(df)
     return pd.concat(frames, ignore_index=True), stats
 
-def load_ledger_stats(files, sample_per_year=15000, chunksize=100000):
-    """Ledger файлуудыг chunk-ээр уншиж stats + txn sample буцаана.
-    Streamlit Cloud дээр OOM болохоос сэргийлнэ.
-    """
+def load_ledger_stats(files):
+    """Ledger файлуудыг уншиж stats + бүрэн DataFrame буцаана."""
     stats = {}
-    sampled_frames = []
-
-    needed_cols = [
-        'report_year','account_code','account_name','transaction_no','transaction_date',
-        'journal_no','document_no','counterparty_name','counterparty_id',
-        'transaction_description','debit_mnt','credit_mnt','balance_mnt','month'
-    ]
-
+    all_frames = []
     for f in files:
         year = get_year(f.name)
-        total_rows = 0
-        acct_set = set()
-        month_set = set()
-        monthly_rows = []
-        sampled_year = []
-
-        try:
-            chunks = read_ledger_in_chunks(f, chunksize=chunksize)
-            for chunk in chunks:
-                total_rows += len(chunk)
-
-                # missing cols fill
-                for c in needed_cols:
-                    if c not in chunk.columns:
-                        chunk[c] = '' if c in ('report_year','account_code','account_name','transaction_no','transaction_date','journal_no','document_no','counterparty_name','counterparty_id','transaction_description','month') else 0
-
-                chunk['account_code'] = chunk['account_code'].astype(str)
-                chunk['debit_mnt'] = pd.to_numeric(chunk['debit_mnt'], errors='coerce').fillna(0)
-                chunk['credit_mnt'] = pd.to_numeric(chunk['credit_mnt'], errors='coerce').fillna(0)
-                chunk['report_year'] = str(year)
-
-                acct_set.update(chunk['account_code'].dropna().astype(str).unique().tolist())
-                month_set.update(chunk['month'].dropna().astype(str).unique().tolist())
-
-                mo = chunk.groupby('month').agg(
-                    rows=('debit_mnt', 'count'),
-                    debit=('debit_mnt', 'sum'),
-                    credit=('credit_mnt', 'sum')
-                ).reset_index()
-                monthly_rows.append(mo)
-
-                # reservoir-like capped sampling per year
-                remaining = max(sample_per_year - sum(len(x) for x in sampled_year), 0)
-                if remaining > 0:
-                    take_n = min(len(chunk), max(1000, remaining))
-                    sample_chunk = chunk.sample(n=min(take_n, len(chunk)), random_state=42)[needed_cols].copy()
-                    sampled_year.append(sample_chunk)
-        except Exception:
-            # fallback: small/full read if chunking failed
-            f.seek(0)
-            chunk = read_ledger(f)
-            total_rows = len(chunk)
-            for c in needed_cols:
-                if c not in chunk.columns:
-                    chunk[c] = '' if c in ('report_year','account_code','account_name','transaction_no','transaction_date','journal_no','document_no','counterparty_name','counterparty_id','transaction_description','month') else 0
-            chunk['account_code'] = chunk['account_code'].astype(str)
-            chunk['debit_mnt'] = pd.to_numeric(chunk['debit_mnt'], errors='coerce').fillna(0)
-            chunk['credit_mnt'] = pd.to_numeric(chunk['credit_mnt'], errors='coerce').fillna(0)
-            chunk['report_year'] = str(year)
-            acct_set.update(chunk['account_code'].dropna().astype(str).unique().tolist())
-            month_set.update(chunk['month'].dropna().astype(str).unique().tolist())
-            monthly_rows.append(chunk.groupby('month').agg(rows=('debit_mnt','count'), debit=('debit_mnt','sum'), credit=('credit_mnt','sum')).reset_index())
-            sampled_year.append(chunk.sample(n=min(sample_per_year, len(chunk)), random_state=42)[needed_cols].copy())
-
-        mo = pd.concat(monthly_rows, ignore_index=True).groupby('month').agg(
-            rows=('rows','sum'),
-            debit=('debit','sum'),
-            credit=('credit','sum')
-        ).sort_index()
-        stats[year] = {'rows': int(total_rows), 'accounts': int(len(acct_set)), 'months': int(len(month_set)), 'monthly': mo}
-
-        if sampled_year:
-            year_sample = pd.concat(sampled_year, ignore_index=True).head(sample_per_year)
-            year_sample['report_year'] = str(year)
-            sampled_frames.append(year_sample)
-
-    full_df = pd.concat(sampled_frames, ignore_index=True) if sampled_frames else pd.DataFrame(columns=needed_cols)
+        f.seek(0)
+        df = read_ledger(f)
+        for c in ['debit_mnt', 'credit_mnt']:
+            df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
+        df['report_year'] = str(year)
+        mo = df.groupby('month').agg(rows=('debit_mnt', 'count'), debit=('debit_mnt', 'sum'), credit=('credit_mnt', 'sum'))
+        stats[year] = {'rows': len(df), 'accounts': df['account_code'].nunique(), 'months': df['month'].nunique(), 'monthly': mo}
+        all_frames.append(df)
+    full_df = pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame()
     return stats, full_df
 
 def load_part1(files):
@@ -975,8 +939,11 @@ if page.startswith("1"):
                         with st.spinner(f"📗 ГҮЙЛГЭЭ_БАЛАНС {d['year']} хөрвүүлж байна..."):
                             d['file'].seek(0)
                             buf, tb_s = process_raw_tb(d['file'])
-                            st.session_state.tb_res[d['year']] = {'buf': buf.getvalue(), 'tb': tb_s}
-                        st.success(f"✅ TB {d['year']}: {len(tb_s):,} данс")
+                            if tb_s.empty:
+                                st.warning(f"⚠️ {d['name']} файлаас TB мөр уншигдсангүй. Формат шалгана уу.")
+                            else:
+                                st.session_state.tb_res[d['year']] = {'buf': buf.getvalue(), 'tb': tb_s}
+                                st.success(f"✅ TB {d['year']}: {len(tb_s):,} данс")
                 if edts:
                     if 'led_res' not in st.session_state:
                         st.session_state.led_res = {}
@@ -1076,12 +1043,15 @@ elif page.startswith("2"):
                 # Auto-convert ГҮЙЛГЭЭ_БАЛАНС → TB_standardized
                 with st.spinner(f"📗 {d['name']} → TB хөрвүүлж байна..."):
                     d['file'].seek(0)
-                    buf, _ = process_raw_tb(d['file'])
-                    buf.seek(0)
-                    tb_wrap = io.BytesIO(buf.getvalue())
-                    tb_wrap.name = f"TB_standardized_{d['year']}1231.xlsx"
-                    tb_files.append(tb_wrap)
-                st.success(f"✅ {d['name']} → TB хөрвүүлсэн")
+                    buf, tb_s = process_raw_tb(d['file'])
+                    if tb_s.empty:
+                        st.warning(f"⚠️ {d['name']} файлаас TB мөр уншигдсангүй. Формат шалгана уу.")
+                    else:
+                        buf.seek(0)
+                        tb_wrap = io.BytesIO(buf.getvalue())
+                        tb_wrap.name = f"TB_standardized_{d['year']}1231.xlsx"
+                        tb_files.append(tb_wrap)
+                        st.success(f"✅ {d['name']} → TB хөрвүүлсэн")
             elif d['type'] == 'edt':
                 # Auto-convert ЕДТ → Ledger + Part1
                 with st.spinner(f"📘 {d['name']} → Ledger + Part1 хөрвүүлж байна..."):
@@ -1138,8 +1108,6 @@ elif page.startswith("2"):
                  "200 = тэнцвэртэй (анхдагч). "
                  "500 = удаан, өндөр нарийвчлал.")
 
-    if led_files:
-        st.caption("Том ledger файлууд дээр memory хэтрэхээс сэргийлж гүйлгээний түвшний шинжилгээнд sample ашиглаж байна.")
     has_any = tb_files or led_files
     if st.button("🚀 Шинжилгээ", type="primary", use_container_width=True) and has_any:
         # Дансны түвшний шинжилгээ (TB + Ledger хоёулаа байвал)
@@ -1151,7 +1119,7 @@ elif page.startswith("2"):
         if tb_files and led_files:
             with st.spinner("TB уншиж байна..."):
                 tb_all, tb_st = load_tb(tb_files)
-            with st.spinner("Ledger уншиж байна... (санамсаргүй sample ашиглаж байна)"):
+            with st.spinner("Ledger уншиж байна..."):
                 led_st, ledger_full = load_ledger_stats(led_files)
             if p1_files:
                 with st.spinner("Part1 уншиж байна..."):
@@ -1160,7 +1128,7 @@ elif page.startswith("2"):
                 df, X, y, feats, res, best, fi, ym = run_ml(tb_all, cont, nest)
         elif led_files:
             # Зөвхөн Ledger байвал — stats + full уншна
-            with st.spinner("Ledger уншиж байна... (санамсаргүй sample ашиглаж байна)"):
+            with st.spinner("Ledger уншиж байна..."):
                 led_st, ledger_full = load_ledger_stats(led_files)
             if p1_files:
                 with st.spinner("Part1 уншиж байна..."):
